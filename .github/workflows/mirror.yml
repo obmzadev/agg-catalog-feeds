@@ -1,0 +1,62 @@
+name: Mirror catalogue feeds
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # 11:00 UTC = 13:00 SAST, one hour before Meta's 14:00 SAST pull
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-feeds
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch, validate and stage feeds
+        env:
+          SOURCE_BASE: https://aggwestrand.co.za/wp-content/uploads/wpallimport/files
+        run: |
+          set -uo pipefail
+          mkdir -p docs tmp
+          critical_fail=0
+          # kind:filename:required(1)/optional(0)
+          for spec in "facebook:autotrader-facebook-catalog.csv:1" "tiktok:autotrader-tiktok-catalog.csv:0"; do
+            IFS=: read -r kind name required <<< "$spec"
+            ok=0
+            if curl -fsSL --retry 3 --retry-delay 10 --max-time 90 \
+                 -A "OBM-Catalog-Mirror/1.0 (+https://github.com/obmzadev/agg-catalog-feeds)" \
+                 -o "tmp/$name" "$SOURCE_BASE/$name"; then
+              if python3 scripts/validate.py "$kind" "tmp/$name" "docs/$name"; then
+                cp "tmp/$name" "docs/$name"; ok=1
+              else
+                echo "::error::Validation failed for $name - keeping last published copy"
+              fi
+            else
+              echo "::error::Fetch failed for $name"
+            fi
+            if [ "$ok" = "0" ] && [ "$required" = "1" ]; then critical_fail=1; fi
+          done
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > docs/last-checked.txt
+          echo "critical_fail=$critical_fail" >> "$GITHUB_ENV"
+
+      - name: Commit published files
+        run: |
+          git config user.name "obm-catalog-mirror"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Mirror catalogue feeds $(date -u +%F)"
+            git push
+          fi
+
+      - name: Fail run if the Facebook feed was not refreshed
+        if: env.critical_fail == '1'
+        run: exit 1
